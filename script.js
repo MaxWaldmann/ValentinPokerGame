@@ -91,8 +91,9 @@ const dom = {
   menuBgCanvas: document.getElementById('menu-bg-canvas'),
   videoLayer: document.getElementById('video-layer'),
   cutsceneVideo: document.getElementById('cutscene-video'),
-  preloadWinVideo: document.getElementById('preload-win-video'),
-  preloadLoseVideo: document.getElementById('preload-lose-video'),
+  videoLoader: document.getElementById('video-loader'),
+  videoManualOverlay: document.getElementById('video-manual-overlay'),
+  btnVideoManualPlay: document.getElementById('btn-video-manual-play'),
   gameScreen: document.getElementById('game-screen'),
   finalOverlay: document.getElementById('final-overlay'),
   finalTitle: document.getElementById('final-title'),
@@ -221,21 +222,36 @@ function initApp() {
     dom.tableFelt.style.backgroundPosition = 'center';
   }
 
-  // Підготувати preload для відео
-  if (CONFIG.introVideo) {
-    dom.cutsceneVideo.src = CONFIG.introVideo;
-    dom.cutsceneVideo.load();
-  }
-  if (CONFIG.winVideo) {
-    dom.preloadWinVideo.src = CONFIG.winVideo;
-  }
-  if (CONFIG.loseVideo) {
-    dom.preloadLoseVideo.src = CONFIG.loseVideo;
+  // Підготувати єдиний спільний <video> елемент для всіх сюжетних роликів
+  const video = dom.cutsceneVideo;
+  if (video) {
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.setAttribute('webkit-playsinline', '');
+
+    // Якщо на сервері (GitHub Pages) файл має інший регістр (StartPlot.mp4 замість Startplot.mp4),
+    // автоматично підхоплюємо правильний регістр ще на етапі прелоаду без зайвого load() перед кліком
+    const onInitialPreloadError = () => {
+      const currentAttr = video.getAttribute('src') || '';
+      const alt = getAlternateCaseVideoPath(currentAttr);
+      if (alt && currentAttr !== alt) {
+        video.src = alt;
+      }
+    };
+    video.addEventListener('error', onInitialPreloadError, { once: true });
+
+    if (CONFIG.introVideo) {
+      const currentAttr = video.getAttribute('src') || '';
+      if (currentAttr.toLowerCase() !== CONFIG.introVideo.toLowerCase()) {
+        video.src = CONFIG.introVideo;
+      }
+    }
   }
 
   // Слухачі кнопок головного меню
+  // ВАЖЛИВО: Для «Грати (Сюжет)» video.play() викликається СИНХРОННО першим у кліку,
+  // строго ДО requestFullscreen() та screen.orientation.lock(), щоб зберегти User Gesture
   dom.btnStory.addEventListener('click', () => {
-    playSfx('uiClick', 0.7);
     handleStartGame('story');
   });
 
@@ -346,10 +362,31 @@ async function tryFullscreenAndLandscape() {
 }
 
 /**
- * Відтворення повноекранних відео-вставок (Startplot.mp4, GoodEnd.mp4, BadEnd.mp4)
+ * Допоміжна функція для резервного регістру імен відеофайлів на чутливих до регістру серверах (GitHub Pages)
+ */
+function getAlternateCaseVideoPath(path) {
+  if (!path) return null;
+  const lower = path.toLowerCase();
+  if (lower === 'startplot.mp4') {
+    return path === 'Startplot.mp4' ? 'StartPlot.mp4' : 'Startplot.mp4';
+  }
+  if (lower === 'goodend.mp4') {
+    return path === 'GoodEnd.mp4' ? 'goodend.mp4' : 'GoodEnd.mp4';
+  }
+  if (lower === 'badend.mp4') {
+    return path === 'BadEnd.mp4' ? 'badend.mp4' : 'BadEnd.mp4';
+  }
+  return null;
+}
+
+/**
+ * Відтворення повноекранних відео-вставок (Startplot.mp4, GoodEnd.mp4, BadEnd.mp4).
+ * - Викликає video.play() синхронно без зайвого video.load(), якщо потрібний src уже встановлений.
+ * - Ніколи не скіпає відео при помилці або блокуванні автозапуску.
+ * - Показує індикатор завантаження під час буферизації та кнопку Liquid Glass «Почати», якщо браузер вимагає повторний клік.
+ * - Перехід далі відбувається суворо по події ended (із захистом від currentTime === 0).
  */
 function playFullscreenVideo(videoPath, onFinished, fadeOutOnEnd = false) {
-  // Гарантуємо, що жодні ігрові SFX не накладаються на відео
   stopAllSfx();
   state.isVideoPlaying = true;
 
@@ -357,25 +394,74 @@ function playFullscreenVideo(videoPath, onFinished, fadeOutOnEnd = false) {
   let finished = false;
   let triedAltCase = false;
 
-  const getAlternateCasePath = (path) => {
-    const lower = path.toLowerCase();
-    if (lower === 'startplot.mp4') {
-      return path === 'Startplot.mp4' ? 'StartPlot.mp4' : 'Startplot.mp4';
+  // 1. Миттєво робимо контейнер відео видимим (display: flex, opacity: 1)
+  dom.videoLayer.classList.remove('hidden', 'fade-out');
+  dom.videoLayer.classList.add('active');
+  dom.videoManualOverlay.classList.add('hidden');
+  dom.videoLoader.classList.add('hidden');
+
+  // 2. Налаштовуємо атрибути мобільного inline-відтворення
+  video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
+  video.muted = false;
+  video.volume = 1.0;
+  video.controls = false;
+
+  // 3. Оновлюємо src ТІЛЬКИ якщо перемикаємося на інший відеофайл (або якщо поточний ресурс у стані помилки).
+  // НЕ викликаємо зайвий video.load(), якщо потрібний src уже встановлений і готовий!
+  const currentSrcAttr = video.getAttribute('src') || '';
+  const isSameFile = currentSrcAttr.toLowerCase() === videoPath.toLowerCase();
+
+  if (!isSameFile || video.error) {
+    video.src = videoPath;
+  } else if (video.currentTime > 0 && video.readyState >= 1) {
+    try {
+      video.currentTime = 0;
+    } catch (e) {
+      // Ігноруємо, якщо seek ще недоступний
     }
-    if (lower === 'goodend.mp4') {
-      return path === 'GoodEnd.mp4' ? 'goodend.mp4' : 'GoodEnd.mp4';
+  }
+
+  const showLoader = () => {
+    if (finished) return;
+    if (dom.videoManualOverlay.classList.contains('hidden')) {
+      dom.videoLoader.classList.remove('hidden');
     }
-    if (lower === 'badend.mp4') {
-      return path === 'BadEnd.mp4' ? 'badend.mp4' : 'BadEnd.mp4';
-    }
-    return null;
+  };
+
+  const hideLoader = () => {
+    dom.videoLoader.classList.add('hidden');
+  };
+
+  const showManualPlayButton = () => {
+    if (finished) return;
+    hideLoader();
+    dom.videoManualOverlay.classList.remove('hidden');
+  };
+
+  const hideManualPlayButton = () => {
+    dom.videoManualOverlay.classList.add('hidden');
+  };
+
+  const cleanupListeners = () => {
+    video.onended = null;
+    video.onerror = null;
+    video.onwaiting = null;
+    video.onloadstart = null;
+    video.onstalled = null;
+    video.onplaying = null;
+    video.oncanplay = null;
+    video.ontimeupdate = null;
+    dom.btnVideoManualPlay.onclick = null;
   };
 
   const complete = () => {
     if (finished) return;
     finished = true;
-    video.onended = null;
-    video.onerror = null;
+    cleanupListeners();
+    hideLoader();
+    hideManualPlayButton();
 
     if (fadeOutOnEnd) {
       dom.videoLayer.classList.add('fade-out');
@@ -395,50 +481,120 @@ function playFullscreenVideo(videoPath, onFinished, fadeOutOnEnd = false) {
     }
   };
 
-  dom.videoLayer.classList.remove('hidden', 'fade-out');
-  dom.videoLayer.classList.add('active');
-
-  video.muted = false;
-  video.volume = 1.0;
-  video.controls = false;
-  video.setAttribute('playsinline', '');
-  video.setAttribute('webkit-playsinline', '');
-
-  video.onended = () => complete();
-
-  video.onerror = () => {
-    const altPath = getAlternateCasePath(videoPath);
-    if (!triedAltCase && altPath) {
-      triedAltCase = true;
-      video.src = altPath;
-      video.load();
-      const p = video.play();
-      if (p !== undefined) {
-        p.catch(() => complete());
-      }
-      return;
-    }
+  // Прив'язуємо перехід суворо до події ended із захистом від випадкового спрацювання на currentTime === 0
+  video.onended = () => {
+    if (video.currentTime <= 0.1) return;
     complete();
   };
 
-  const currentSrcAttr = video.getAttribute('src');
-  if (currentSrcAttr !== videoPath) {
-    video.src = videoPath;
-    video.load();
-  } else {
-    try {
-      video.currentTime = 0;
-    } catch (e) {
-      // Ігноруємо якщо метадані ще не завантажені
+  // Індикатор буферизації через мобільний інтернет
+  video.onloadstart = () => {
+    if (video.paused || video.readyState < 3) {
+      showLoader();
     }
+  };
+
+  video.onwaiting = () => {
+    showLoader();
+  };
+
+  video.onstalled = () => {
+    if (video.currentTime === 0 || video.readyState < 3) {
+      showLoader();
+    }
+  };
+
+  video.oncanplay = () => {
+    if (!video.paused) {
+      hideLoader();
+    }
+  };
+
+  video.onplaying = () => {
+    hideLoader();
+    hideManualPlayButton();
+  };
+
+  video.ontimeupdate = () => {
+    if (video.currentTime > 0.05) {
+      hideLoader();
+      hideManualPlayButton();
+    }
+  };
+
+  // Обробка помилки джерела (наприклад, різниця регістру Startplot.mp4 vs StartPlot.mp4 на GitHub Pages)
+  // Жодного автоматичного скіпу на стіл!
+  video.onerror = () => {
+    const activeSrc = video.getAttribute('src') || videoPath;
+    const altPath = getAlternateCaseVideoPath(activeSrc);
+    if (!triedAltCase && altPath) {
+      triedAltCase = true;
+      showLoader();
+      video.src = altPath;
+      const retryPromise = video.play();
+      if (retryPromise !== undefined) {
+        retryPromise.catch(() => {
+          showManualPlayButton();
+        });
+      }
+      return;
+    }
+    showManualPlayButton();
+  };
+
+  // Кнопка Liquid Glass «Почати» на випадок, якщо браузер заблокував автозапуск
+  dom.btnVideoManualPlay.onclick = () => {
+    hideManualPlayButton();
+    if (video.readyState < 3) {
+      showLoader();
+    }
+    video.muted = false;
+    video.volume = 1.0;
+    const manualPromise = video.play();
+    if (manualPromise !== undefined) {
+      manualPromise.catch(() => {
+        showManualPlayButton();
+      });
+    }
+  };
+
+  // Якщо відео ще не буферизовано достатньо — показуємо мінімалістичний індикатор завантаження
+  if (video.readyState < 3) {
+    showLoader();
   }
 
-  const playPromise = video.play();
-  if (playPromise !== undefined) {
-    playPromise.catch(() => {
-      video.muted = true;
-      video.play().catch(() => complete());
-    });
+  // 4. Викликаємо video.play() СИНХРОННО в контексті User Gesture
+  try {
+    const playPromise = video.play();
+    if (playPromise !== undefined) {
+      playPromise
+        .then(() => {
+          if (video.readyState >= 3) {
+            hideLoader();
+          }
+        })
+        .catch(() => {
+          // Якщо помилка виникла через інший регістр імені файлу на сервері — пробуємо альтернативний регістр
+          const activeSrc = video.getAttribute('src') || videoPath;
+          const altPath = getAlternateCaseVideoPath(activeSrc);
+          if (!triedAltCase && altPath && (video.error || video.networkState === 3)) {
+            triedAltCase = true;
+            showLoader();
+            video.src = altPath;
+            const retryPromise = video.play();
+            if (retryPromise !== undefined) {
+              retryPromise.catch(() => {
+                showManualPlayButton();
+              });
+            }
+            return;
+          }
+          // Жодного скіпу в гру: показуємо кнопку Liquid Glass «Почати»
+          showManualPlayButton();
+        });
+    }
+  } catch (err) {
+    showManualPlayButton();
   }
 }
 
@@ -448,7 +604,6 @@ function playFullscreenVideo(videoPath, onFinished, fadeOutOnEnd = false) {
  * ============================================================================
  */
 function handleStartGame(mode) {
-  tryFullscreenAndLandscape();
   clearAllTimers();
 
   state.mode = mode;
@@ -459,16 +614,8 @@ function handleStartGame(mode) {
   // Встановлюємо 'boss', щоб на старті 1-го раунду дилером став 'player' (і в 7-му раунді також 'player')
   state.dealer = 'boss';
 
-  dom.startMenu.classList.remove('active');
-  dom.startMenu.classList.add('hidden');
-  dom.finalOverlay.classList.remove('active');
-  dom.finalOverlay.classList.add('hidden');
-
   if (mode === 'story') {
-    dom.gameScreen.classList.remove('hidden');
-    dom.gameScreen.classList.add('active');
-    resetTableUIForNewGame();
-
+    // 1. СИНХРОННО запускаємо вступне відео Startplot.mp4 ДО requestFullscreen() та orientation.lock()
     playFullscreenVideo(
       CONFIG.introVideo,
       () => {
@@ -476,10 +623,37 @@ function handleStartGame(mode) {
       },
       true
     );
-  } else {
+
+    // 2. Підготовлюємо ігровий стіл під шаром відео
+    dom.startMenu.classList.remove('active');
+    dom.startMenu.classList.add('hidden');
+    dom.finalOverlay.classList.remove('active');
+    dom.finalOverlay.classList.add('hidden');
     dom.gameScreen.classList.remove('hidden');
     dom.gameScreen.classList.add('active');
     resetTableUIForNewGame();
+
+    // 3. Запускаємо запит Fullscreen та орієнтації ПІСЛЯ ініціації video.play() в окремому try/catch
+    try {
+      tryFullscreenAndLandscape();
+    } catch (e) {
+      // Безпечно ігноруємо
+    }
+  } else {
+    dom.startMenu.classList.remove('active');
+    dom.startMenu.classList.add('hidden');
+    dom.finalOverlay.classList.remove('active');
+    dom.finalOverlay.classList.add('hidden');
+    dom.gameScreen.classList.remove('hidden');
+    dom.gameScreen.classList.add('active');
+    resetTableUIForNewGame();
+
+    try {
+      tryFullscreenAndLandscape();
+    } catch (e) {
+      // Безпечно ігноруємо
+    }
+
     startNextHand();
   }
 }
